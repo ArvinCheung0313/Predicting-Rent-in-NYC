@@ -1,0 +1,1075 @@
+---
+title: "Kaggle Competition"
+author: "Yantuo (Arvin) Zhang"
+date: "11/29/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse); library(ggplot2); library(caret); library(broom)
+library(dplyr); library(na.tools); library(naniar); library(leaps); 
+library(descr); library(skimr); library(data.table); library(psych);
+library(lubridate);library(DT)
+```
+
+# {.tabset}
+
+## Preparation {.tabset}
+
+### Load Data
+
+First, let's set up the work directory and take a glance of the raw analysis data.  
+
+```{r}
+setwd("/Users/arvinzhang/Desktop/APAN5200_Kitty/Kaggle/Kaggle_2")
+analysis_raw <- read_csv("analysisData.csv")
+head(analysis_raw)
+```
+
+### Locate Missing Data
+
+First, let's see the cleanliness of the data set. We can see that there are several variables have large number of missing values, we need to filter them out as it is unnecessary to the analysis.  
+
+```{r clean missing data}
+miss_var <- miss_var_summary(analysis_raw); miss_var
+miss_var %>%
+  filter(pct_miss > 0) %>%
+  ggplot(aes(x = reorder(variable, pct_miss), y = pct_miss)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Proportions of Missing Values by Variables",
+       x = "Proportions of Missing Values",
+       y = "Variables")
+```
+
+### Filter Missing Data less than 25%
+
+Filter for variables whose pct_miss is less than 25%, leaving 78 variables.
+
+```{r filter variables}
+var_keep <- miss_var %>%
+  filter(pct_miss < 25)
+datatable(var_keep)
+```
+
+### Find Other Type of Missing Data
+
+See if there are other types of missing data.  
+
+Done, omit these 9 missing variables first to build models.  
+
+```{r missing na}
+miss_na_var <- analysis_raw %>%
+  select(var_keep$variable) %>%
+  miss_scan_count(search = list("N/A", "na")) %>%
+  arrange(desc(n)) %>%
+  filter(n > 0)
+datatable(miss_na_var)
+```
+
+## 1st Round of Data Cleaning {.tabset}
+
+### Omit missing variables
+
+Now, we would need to filter variables with many missing values. Some steps weren't showed as I keep using function **skim()** to check the features and distributions of each variables.    
+
+According to general knowledge, we can manually clear irrelevant variables.  
+
+Also, we can see some variables are character but actually are categorical factors such as `neighbourhood_group_cleansed`, `property_type`, `room_type`, `bed_type`, and `cancellation_policy`, we need to convert them into factors so that we can conduct further analysis.  
+
+By looking at the distribution of some variables such as `has_availability`, `requires_license`, `is_business_travel_ready`,we can see they only contain single value, meaning they are unimportant to the analysis, so let's omit them.  
+
+Moreover, there are some rows with prices equal to 0, which makes no sense, thus we need to clear them out.  
+
+At last, we need to fill missing values, we use function **fill()** for variables with integer and logical values such as `beds`, `host_is_superhost`, `host_total_listings_count`, `host_has_profile_pic`, and `host_identity_verified`, and use mean values to fill missing values for continuous factors like `reviews_per_month`, and `cleaning_fee`.  
+
+```{r 1st round of data cleaning}
+analysis <- analysis_raw %>%
+  # filter variables with many missing values
+  select(var_keep$variable) %>%
+  select(!miss_na_var$Variable) %>%
+  # omit unimportant variables according to general knowledge
+  select(-host_listings_count, -market, -id, 
+         -zipcode, -number_of_reviews, - state, -country_code, -country,
+         -calendar_updated, -host_verifications, -require_guest_profile_picture, 
+         -require_guest_phone_verification) %>%
+  # change character to factor
+  mutate(neighbourhood_group_cleansed = as.factor(neighbourhood_group_cleansed),
+         property_type = as.factor(property_type),
+         room_type = as.factor(room_type),
+         bed_type = as.factor(bed_type),
+         cancellation_policy = as.factor(cancellation_policy)) %>%
+  # omit single value variables
+  select(-has_availability, -requires_license, -is_business_travel_ready) %>%
+  # clear rows with price == 0
+  filter(price != 0) %>%
+  # fill missing values in host_is_superhost, host_has_profile_pic, host_identity_verified, and
+  # host_total_listing_count
+  fill(host_is_superhost, host_total_listings_count, host_has_profile_pic, host_identity_verified, 
+       first_review, last_review, host_since) %>%
+  # place price column to the first place
+  select(price, everything())
+
+# change first_review
+analysis$first_review = as.numeric(floor(difftime("2020-12-31", analysis$first_review, units = "days")))
+# change last_review
+analysis$last_review = as.numeric(floor(difftime("2020-12-31", analysis$last_review, units = "days")))
+# change host_since
+analysis$host_since = as.numeric(floor(difftime("2020-12-31", analysis$host_since, units = "days")))
+
+# fill missing values in beds with ceiling(mean(beds))
+analysis$beds[is.na(analysis$beds)] = ceiling(mean(analysis$beds, na.rm = T))
+# fill missing values in cleaning_fee with avg. cleaning_fee
+analysis$cleaning_fee[is.na(analysis$cleaning_fee)] = mean(analysis$beds, na.rm = T)
+# fill rows with cleaning_fee = 0 with mean(cleaning_fee)
+analysis[analysis$cleaning_fee == 0, c("cleaning_fee")] = mean(analysis$cleaning_fee)
+# fill missing values in reviews_per_month with avg. reviews_per_month
+analysis$reviews_per_month[is.na(analysis$reviews_per_month)] = mean(analysis$reviews_per_month, na.rm = T)
+
+# check if there are still missing values
+datatable(miss_var_summary(analysis))
+```
+
+### Clean High-dimensional Variables
+
+#### Explore Property Type  
+
+Notice that `property_type` has 33 unique values, it may be too much for modeling, let's see what's going on.
+
+```{r explore factors}
+analysis %>%
+  group_by(property_type) %>%
+  count() %>%
+  arrange(desc(n))
+
+analysis %>%
+  group_by(property_type) %>%
+  count() %>%
+  ggplot(aes(x = reorder(property_type, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Property Types of NY Airbnb Rentals", 
+       x = "Number of Rentals", 
+       y = "Property Type")
+```
+
+#### Reduce Dimensionality of Variables
+
+Obviously, there are too many categories in `property_type`, we need to collapse small size factors into `Others`, and categorize them into specific categories.  
+
+Also, `cancellation_policy` has 6 categories and the size of strict factor is pretty small, so we can incorporate them into `strict` category. Noticed `cancellation_policy` is actually ordinal variable, so we can convert it into a dummy variable.  
+
+```{r collapse small size factors}
+analysis <- analysis %>%
+  # collapse property_type factors
+  mutate(
+    property_type = fct_collapse(property_type, 
+                                 "Apartment" = c("Apartment", "Serviced apartment"),
+                                 "Condominium" = "Condominium",
+                                 "House" = c("Bungalow", "House", "Guesthouse", "Hostel", 
+                                             "Tiny house", "Townhouse", "Treehouse", 
+                                             "Dome house", "Villa"),
+                                 "Loft" = "Loft",
+                                 "Hotel" = c("Hotel", "Bed and breakfast", "Boutique hotel", 
+                                             "Guest suite", "Resort"))
+    ) %>%
+  mutate(property_type = fct_other(property_type, keep = c("Apartment", "Condominium", "House", 
+                                                           "Loft", "Hotel"))) %>%
+  # collapse cancellation_policy
+  mutate(cancellation_policy = fct_collapse(cancellation_policy, 
+                                       "strict" = c("strict", "super_strict_30", "super_strict_60",
+                                                    "strict_14_with_grace_period"))) %>%
+  # transform cancellation_policy into ordinal variables
+  mutate(cancellation_policy = case_when(
+    cancellation_policy == "flexible" ~ 3,
+    cancellation_policy == "moderate" ~ 2,
+    cancellation_policy == "strict" ~ 1
+  ))
+```
+
+### Take a Look
+
+So far, we finished the 1st round of data cleaning. Congrats!! At last, we have **48** variables in `analysis` data set. Perfect!  
+
+```{r}
+# see the structure of analysis
+skim(analysis)
+```
+
+## Explore Data Analysis {.tabset}
+
+### Price Distribution
+
+Let's see the distribution of price. We can see that price is heavily right-skewed, so we may need to **logarithm** the price using linear regression.  
+
+```{r}
+analysis %>%
+  ggplot(aes(price)) +
+  geom_histogram(bins = 50)
+```
+
+### Factorial Variables
+
+#### Neighbourhood Grop Cleansed
+
+Apparently, **Manhattan** has the highest rental price, followed by **Brooklyn**, and **Bronx** has the lowest rental price level.  
+
+```{r price vs neighbourhood}
+analysis %>%
+  ggplot(aes(x = fct_reorder(neighbourhood_group_cleansed, price), log(price))) +
+    geom_boxplot() +
+    labs(title = "Prices Level in log by Neighbourhood", 
+       x = "Area", 
+       y = "Price, log")
+```
+
+#### Property Type
+
+##### Price vs property_type
+
+It seems **Loft** and **Condominium** have highest price level, while **House** is the lowest.  
+
+```{r price vs property_type}
+analysis %>%
+  ggplot(aes(x = fct_reorder(property_type, log(price)), log(price))) +
+  geom_boxplot() +
+  labs(title = "Prices Level in log by Property Type", 
+       x = "Property", 
+       y = "Price, log")
+```
+
+##### Distribution of property_type
+
+```{r distribution of property_type}
+analysis %>%
+  ggplot(aes(x = property_type)) +
+  geom_bar() +
+  labs(title = "Number of rentals by Property Type", 
+       x = "Property Type", 
+       y = "Number of Rentals")
+```
+
+#### Room Type
+
+```{r}
+analysis %>%
+  ggplot(aes(x = fct_reorder(room_type, price), log(price))) +
+  geom_boxplot() +
+  labs(title = "Prices Level in log by Room Type", 
+       x = "Room Type", 
+       y = "Price, log")
+```
+
+```{r}
+analysis %>%
+  ggplot(aes(x = room_type)) +
+  geom_bar() +
+  labs(title = "Number of Rentals by Room Type", 
+       x = "Room Type", 
+       y = "Number of Rentals")
+```
+
+#### Bed Type
+
+Well, almost 99% of bed are real bed, and it would do nothing in predicting the prices. Omit it.
+
+```{r}
+analysis %>%
+  ggplot(aes(x = bed_type)) +
+  geom_bar() +
+  labs(title = "Number of Rentals by Bed Type", 
+       x = "Bed Type", 
+       y = "Number of Rentals")
+```
+
+### Logical Variables
+
+Next we take a look at logical variabels.  
+
+There are **99.7%** of `host_has_profile_pic` are TRUE, meaning the variable may not have significant impact on the `price`. Omit this variable.
+
+```{r logical variables}
+analysis %>%
+  select_if(is.logical) %>%
+  pivot_longer(cols = 1:5, names_to = "predictors", values_to = "values") %>%
+  group_by(predictors, values) %>%
+  count() %>%
+  ungroup() %>%
+  ggplot(aes(x = values, y = n)) +
+  geom_col() +
+  facet_wrap(predictors ~., scales = "free") +
+  labs(title = "Distributions Rentals of Factorial Variables",
+       x = "Logical Factors",
+       y = "Number of Rentals")
+```
+
+### Numeric Variables {.tabset}
+
+#### Cleaning Fee
+
+Let's first take a look of the relationship between `price` and `cleaning_fee`, we can see that it has a correlation between them, indicating that `cleaning_fee` is a key factor of `price`.  
+
+```{r}
+analysis %>%
+  ggplot(aes(cleaning_fee, price)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = F) +
+  labs(title = "Price in log by Cleaning Fee",
+       x = "Cleaning Fee",
+       y = "Price, log")
+```
+
+#### Accommodates
+
+##### Avg. Price with Accommodates
+
+It's not obvious by merely looking at the distribution of each accommodate with price level. We can cansider discretize `accommodates` to see if there is a relationship.  
+
+```{r}
+analysis %>%
+  group_by(accommodates) %>%
+  summarize(n = n(),
+            mean = round(mean(price), 4)) %>%
+  datatable()
+```
+
+##### Feature Discre.- Accommodates
+
+It's obvious now that price increases when the accomodates increase, we can keep this variable for later analysis.  
+
+We can see that there is only one observation in the group (16,19], so we can later put it in (13,16] if we use this discretized variable `acco_cut`.  
+
+```{r}
+acco_cut <- analysis %>%
+  summarize(acco_cut = cut(accommodates, seq(1, 19, 3), include.lowest = T))
+analysis %>%
+  cbind(acco_cut) %>%
+  group_by(acco_cut) %>%
+  summarize(n = n(),
+            mean_price = mean(price),
+            mean_clean = round(mean(cleaning_fee), 4)) %>%
+  datatable()
+```
+
+#### Beds
+
+##### Distribution of Price by Beds
+
+There is also a correlation between price and beds, we can include it in later modeling.  
+
+```{r price vs beds}
+analysis %>%
+  ggplot(aes(beds, log(price))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F) +
+  labs(title = "Price in log by Beds",
+       x = "Beds",
+       y = "Price, log")
+```
+
+##### Price with Beds
+
+Let's see if it's necessary to discretize `beds`.  
+
+```{r}
+analysis %>% 
+  group_by(beds) %>%
+  summarize(n = n(),
+            mean = mean(price)) %>%
+  datatable()
+```
+
+##### Feature Discre. - Beds
+
+As we can see, we can collapse observations whose the number of beds is greater than 12.  
+
+```{r}
+beds_cut <- analysis %>%
+  summarize(beds_cut = cut(beds, seq(0, 27, 3), include.lowest = T))
+analysis %>%
+  cbind(beds_cut) %>%
+  group_by(beds_cut) %>%
+  summarize(n = n(), 
+            mean_price = round(mean(price), 4),
+            mean_clean = round(mean(cleaning_fee), 4)) %>%
+  datatable()
+```
+
+#### Bedrooms
+
+##### Distribution of Price by Bedrooms
+
+I will explore the rest numeric variables as I did above.  
+
+```{r}
+analysis %>%
+  ggplot(aes(bedrooms, log(price))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F) +
+  labs(title = "Price in log by Bedrooms",
+       x = "Bedrooms",
+       y = "Price, log")
+```
+
+##### Avg. Price with Bedrooms
+
+```{r}
+analysis %>%
+  group_by(bedrooms) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+##### Feature Discre. - Bedrooms
+
+```{r}
+bedrooms_cut <- analysis %>%
+  summarize(bedrooms_cut = cut(bedrooms, seq(0, 10, 2), include.lowest = T))
+analysis %>%
+  cbind(bedrooms_cut) %>%
+  group_by(bedrooms_cut) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+#### Bathrooms
+
+##### Distribution of Price by Bathrooms
+
+```{r}
+analysis %>%
+  ggplot(aes(bathrooms, log(price))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F) +
+  labs(title = "Price in log by Bathrooms",
+       x = "Bathrooms",
+       y = "Price, log")
+```
+
+##### Avg. Prics with Bathrooms
+
+```{r}
+analysis %>%
+  group_by(bathrooms) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+##### Feature Discre. - Bathrooms
+
+```{r}
+bathrooms_cut <- analysis %>%
+  summarize(bathrooms_cut = case_when(
+    bathrooms %in% c(0.0, 0.5, 1.0) ~ 1,
+    bathrooms %in% c(1.5, 2.0) ~ 2,
+    bathrooms %in% c(2.5, 3.0) ~ 3,
+    TRUE ~ 4
+  ))
+analysis %>%
+  cbind(bathrooms_cut) %>%
+  group_by(bathrooms_cut) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+#### Guests_included
+
+##### Distribuiton of Price by Guests Included
+
+```{r}
+analysis %>%
+  ggplot(aes(guests_included, price)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F)
+```
+
+##### Avg. Price with Guests_included
+
+```{r}
+analysis %>%
+  group_by(guests_included) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+##### Feature Discre. - Guests_included
+
+```{r}
+guests_cut <- analysis %>%
+  summarize(guests_cut = cut(guests_included, seq(0, 18, 3)))
+analysis %>%
+  cbind(guests_cut) %>%
+  group_by(guests_cut) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+#### Extra_people
+
+##### Distribution of Price by Extra People
+
+```{r}
+analysis %>%
+  ggplot(aes(extra_people, price)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = F)
+```
+
+##### Avg. Price with Extra_people
+
+```{r}
+analysis %>%
+  group_by(extra_people) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+##### Feature Discre. - Extra_people
+
+```{r}
+extra_cut <- analysis %>%
+  summarize(extra_cut = cut(extra_people, seq(0, 300, 50), include.lowest = T))
+analysis %>%
+  cbind(extra_cut) %>%
+  group_by(extra_cut) %>%
+  summarize(n = n(),
+            mean_price = round(mean(price), 4)) %>%
+  datatable()
+```
+
+
+#### Amenities
+
+Since I believe amenities have an significant impact on price, I would like to first split them into separate words, then I would like to count the number of amenities each unit has to see whether it has a relationship with the price.  
+
+##### Separation of Amenities
+
+```{r}
+library(wordcloud2)
+# clean character
+amenities_list <- str_split(analysis$amenities, ",")
+amenities <- unlist(amenities_list)
+amenities <- str_remove(amenities, fixed("."))
+amenities <- amenities[amenities != ""]
+amenities <- str_trim(amenities, "both")
+
+# create word cloud
+as.data.frame(amenities) %>%
+  count(amenities, sort = T) %>%
+  wordcloud2(size = 0.5)
+
+# extract top10 amenities
+amenities_top10 <- as.data.frame(amenities, stringsAsFactors = F) %>%
+  count(amenities, sort = T) %>% head(10)
+sort_amenities <- with(amenities_top10, reorder(amenities, n, mean))
+ggplot(amenities_top10, aes(x = sort_amenities, weight = n)) +
+  geom_bar(show.legend = F) +
+  theme_bw() +
+  coord_flip() +
+  labs(title = "Top 10 Amenities",
+       x = "",
+       y = "")
+```
+
+### Correlation Between Numeric Variables
+
+Suddenly, I realize I could draw correlation plot between dependent variables rather than plotting one by one as there are variables with similar names, made me wondering if there are high correlation between them, so I would first subset similar variables, then check correlation one group after one group.  
+
+#### Subset Similar Variables
+
+**Availability Variables:**  
+
+We can keep `availability_30` and `availability_365` and drop the others since most customers are looking for short-term rental.  
+
+**Review Scores:**  
+
+Everthing seems fine.
+
+**Host Listing Count:**  
+
+We can see that `calculated_host_lilstings_count` is highly correlated with `calculated_host_listings_count_entire_homes`, we can drop the former.
+
+**Minimum & Maximum Nights:**  
+
+We keep `minimum_nights_avg_ntm` and drop the others.
+
+```{r}
+library(ggcorrplot)
+# availability group
+availability_group <- analysis %>% select(starts_with("availability"))
+ggcorrplot(cor(availability_group), method = "square", type = "lower", show.diag = T, 
+           colors = c("#6D9EC1", "white", "#E46726"), lab = T, digits = 3)
+
+# review_scores group
+review_scores_group <- analysis %>% select(starts_with("review_scores"))
+ggcorrplot(cor(review_scores_group), method = "square", type = "lower", show.diag = T, 
+           colors = c("#6D9EC1", "white", "#E46726"), lab = T, digits = 2)
+
+# host_listing_count group
+cal_host_listing_count_group <- analysis %>% select(starts_with("calculated"), host_total_listings_count)
+ggcorrplot(cor(cal_host_listing_count_group), method = "square", type = "lower", show.diag = T, 
+           colors = c("#6D9EC1", "white", "#E46726"), lab = T, digits = 2)
+
+# minimum & maximum
+minimum_maximum <- analysis %>% select(starts_with("minimum"), starts_with("maximum"))
+ggcorrplot(cor(minimum_maximum), method = "square", type = "lower", show.diag = T, 
+           colors = c("#6D9EC1", "white", "#E46726"), lab = T, digits = 2)
+
+```
+
+#### Correlation Between Other Numeric Variables
+
+Now, we take a look at the correlation between other numeric variables. It seems there doesn't have severe multicollinearity between these variables. However, `cancellation_policy`, `reviews_per_month`, `number_of_reviews` and `extra_people` have low correlation with `price`, we will examine these variables later in linear regression.  
+
+```{r}
+ggcorrplot(cor(analysis[, c("cleaning_fee", "accommodates", "bedrooms", "beds", "bathrooms", 
+                            "guests_included", "extra_people", "number_of_reviews_ltm", 
+                            "reviews_per_month", "first_review", "last_review", "host_since", 
+                            "price")]), 
+           method = "square", type = "lower",
+           show.diag = T, colors = c("#6D9EC1", "white", "#E46726"), lab = T, digits = 1)
+```
+
+## 2nd Round of Data Cleaning {.tabset}
+
+### Analysis Data Cleaning
+
+After EDA, we again found some unimportant variables and need to omit them from the analysis. So far, we have **37** variables including `price` in analysis. Now it's time to build some models! Wait, we have to do the same thing to **scoring_raw** to ensure these two data files have the same structure.  
+
+```{r 2nd round of data cleaning}
+# omit useless variables
+analysis <- analysis %>%
+  select(-host_has_profile_pic, -minimum_minimum_nights, -minimum_maximum_nights, -minimum_nights,
+         -maximum_nights, -maximum_maximum_nights, -maximum_minimum_nights, 
+         -maximum_nights_avg_ntm, -calculated_host_listings_count, 
+         -availability_60, -availability_90)
+
+# convert logical into factor
+logic <- sapply(analysis, is.logical)
+analysis[, logic] <- sapply(analysis[, logic], as.numeric)
+
+# Convert Amenities into Number of Amenities
+analysis$amenities <- sapply(amenities_list, length)
+
+# double check
+skim(analysis)
+```
+
+### Scoring Data Cleaning
+
+#### Read Data
+
+```{r read scoringdata}
+scoring_raw <- read.csv("scoringData.csv")
+```
+
+#### Routine Data Cleaning
+
+First, I would create a price column for convenience as I would use the names of variables from **analysis** to select necessary variables.  
+
+Then, let's take a look at the data. We can see that some there are 10 character variables, and we need to convert them into the same type as from analysis.  
+
+Beautiful!  
+
+```{r scoring_raw cleaning}
+scoring <- scoring_raw %>%
+  # create a price column for convenience
+  mutate(price = 1) %>%
+  # select chosen variables from analysis
+  select(id, names(analysis)) %>%
+  # change types of variables
+  mutate(
+    host_is_superhost = as.numeric(ifelse(host_is_superhost == "f", 0, 1)),
+    host_identity_verified = as.numeric(ifelse(host_identity_verified == "f", 0, 1)),
+    is_location_exact = as.numeric(ifelse(is_location_exact == "f", 0, 1)),
+    instant_bookable = as.numeric(ifelse(instant_bookable == "f", 0, 1)),
+    # host_has_profile_pic = as.numeric(ifelse(host_has_profile_pic == "f", 0, 1)),
+    bed_type = as.factor(bed_type)
+  ) %>%
+  # change character to factor
+  mutate(
+    neighbourhood_group_cleansed = as.factor(neighbourhood_group_cleansed),
+    property_type = as.factor(property_type),
+    room_type = as.factor(room_type),
+    cancellation_policy = as.factor(cancellation_policy)
+  ) %>%
+  # collapse property_type factors
+  mutate(
+    property_type = fct_collapse(property_type, 
+                                 "Apartment" = c("Apartment", "Serviced apartment"),
+                                 "Condominium" = "Condominium",
+                                 "House" = c("Bungalow", "House", "Guesthouse", "Hostel", 
+                                             "Tiny house", "Townhouse", "Lighthouse", 
+                                             "Dome house", "Earth house", "Villa"),
+                                 "Loft" = "Loft",
+                                 "Hotel" = c("Hotel", "Bed and breakfast", "Boutique hotel", 
+                                             "Guest suite", "Resort"))
+    ) %>%
+  mutate(property_type = fct_other(property_type, keep = c("Apartment", "Condominium", "House", 
+                                                           "Loft", "Hotel"))) %>%
+  mutate(cancellation_policy = fct_collapse(cancellation_policy, 
+                                       "strict" = c("strict", "super_strict_30", "super_strict_60",
+                                                    "strict_14_with_grace_period"))) %>%
+  # transform cancellation_policy into dummy variables
+  mutate(cancellation_policy = case_when(
+    cancellation_policy == "flexible" ~ 3,
+    cancellation_policy == "moderate" ~ 2,
+    cancellation_policy == "strict" ~ 1
+   )) %>%
+  # fill missing values in host_total_listings_count
+  fill(host_total_listings_count) %>%
+  # remove column price
+  select(-price) %>%
+  # convert data into period
+  mutate(last_review = as.Date(last_review),
+         host_since = as.Date(host_since)) %>%
+  as_tibble()
+
+# change first_review
+scoring$first_review = as.numeric(floor(difftime("2020-12-31", scoring$first_review, units = "days")))
+# change last_review
+scoring$last_review = as.numeric(floor(difftime("2020-12-31", scoring$last_review, units = "days")))
+# change host_since
+scoring$host_since = as.numeric(floor(difftime("2020-12-31", scoring$host_since, units = "days")))
+
+# fill missing values in beds with ceiling(mean(beds))
+scoring$beds[is.na(scoring$beds)] = ceiling(mean(scoring$beds, na.rm = T))
+# fill missing values in cleaning_fee with avg. cleaning_fee
+scoring$cleaning_fee[is.na(scoring$cleaning_fee)] = mean(scoring$cleaning_fee, na.rm = T)
+# fill missing values in host_since
+scoring$host_since[is.na(scoring$host_since)] = floor(mean(scoring$host_since, na.rm = T))
+
+# convert integer into numeric
+int <- unlist(lapply(scoring, is.integer))
+scoring[, int] <- lapply(scoring[, int], as.numeric)
+
+# double check
+datatable(miss_var_summary(scoring))
+```
+
+#### Convert Amenities into Number of Amenities
+
+For now, scoring data has the same data structure as analysis data set. Good job!  
+
+```{r}
+amenities_sc_list <- str_split(scoring$amenities, ", ")
+scoring$amenities <- sapply(amenities_sc_list, length)
+skim(scoring)
+```
+
+## Split Data
+
+First, split the data into 70% to the train set, 30% to the test set.
+
+```{r split analysis}
+set.seed(1031)
+split = createDataPartition(y = analysis$price, p = 0.7, list = F, groups = 10)
+train = analysis[split, ]
+test = analysis[-split, ]
+```
+
+## Linear Regression
+
+First, let's use the simple linear regression to see the performance. The results are shown below:  
+R2: 0.5309  
+RSE: 75.38  
+RMSE_test: 78.33  
+
+```{r}
+mod1 = lm(price ~ ., data = train)
+summary(mod1)
+
+# predict using test
+pred_mod1_test = predict(mod1, newdata = test)
+rmse_mod1_test = sqrt(mean((pred_mod1_test - test$price)^2)); rmse_mod1_test
+```
+
+## Forward Selection
+
+First, let's use forward selection. We can see that it didn't select `reviews_per_month`, `bed_type`, `cancellation_policy`, `calculated_host_listings_count_entire_homes`, and `host_since`.  
+
+R2: 0.5308  
+RSE: 75.37  
+RMSE_test: 78.31  
+
+```{r forward selection}
+start_mod = lm(price ~ 1, train)
+empty_mod = lm(price ~ 1, train)
+full_mod = lm(price ~ ., train)
+forward_selection = step(start_mod,
+                      scope = list(upper = full_mod, lower = empty_mod),
+                      direction ='forward')
+summary(forward_selection)
+
+# predict using test
+pred_fw_test = predict(forward_selection, newdata = test)
+rmse_fw_test = sqrt(mean((pred_fw_test - test$price)^2)); rmse_fw_test
+```
+
+## Lasso 
+
+Also, we can use lasso to see if we can see different results.
+
+```{r lasso}
+library(glmnet)
+x = model.matrix(price ~ .-1, data = train)
+y = train$price
+
+cv_lasso = cv.glmnet(x = x, 
+                     y = y, 
+                     alpha = 1,
+                     type.measure = 'mse')
+plot(cv_lasso)
+coef(cv_lasso, s = cv_lasso$lambda.1se) %>%
+  round(4)
+```
+### Performance of Lasso
+
+We use features selected from Lasso to run a linear model to see the results.
+
+R2: 0.5261  
+RSE: 75.73  
+RMSE_test: 78.84  
+
+```{r}
+# subset variables
+analysis_la <- analysis %>% select(-beds, -host_since, -host_is_superhost, -host_identity_verified,
+                                   -host_total_listings_count, -first_review, -reviews_per_month,
+                                   -is_location_exact, -bed_type, -amenities, -extra_people, 
+                                   -review_scores_rating, -review_scores_accuracy, 
+                                   -review_scores_checkin, -review_scores_communication,
+                                   -review_scores_value, -cancellation_policy, -instant_bookable,
+                                   -calculated_host_listings_count_entire_homes, 
+                                   -calculated_host_listings_count_private_rooms)
+train_la <- train %>% select(names(analysis_la))
+test_la <- test %>% select(names(analysis_la))
+# Lasso model
+mod_lasso <- lm(price ~ ., data = train_la)
+summary(mod_lasso)
+
+# check the results
+pred_la_test = predict(mod_lasso, newdata = test_la)
+rmse_la_test = sqrt(mean((pred_la_test - test_la$price)^2)); rmse_la_test
+```
+
+### Tune Lasso
+
+Lambda = 0.0515
+R2: 0.5225  
+RMSE_cv: 76.71  
+
+```{r}
+trControl_la <-trainControl(method = "cv", number = 5)
+tuneGrid_la <- expand.grid(alpha = 1, lambda = seq(0.001, 0.1, by = 0.0005))
+
+mod_lasso_cv <- train(price ~ ., data = analysis_la,
+                method = 'glmnet', 
+                trControl = trControl_la, 
+                tuneGrid = tuneGrid_la)
+
+mod_lasso_cv$bestTune
+min(mod_lasso_cv$results$Rsquared)
+rmse_la_cv = min(mod_lasso_cv$results$RMSE); rmse_la_cv
+```
+
+## Regression Tree {.tabset}
+
+### Default Tree 
+
+RMSE_train: 80.99  
+RMSE_test: 84.47  
+
+```{r tree1}
+library(rpart); library(rpart.plot)
+tree1 = rpart(price ~ ., data = train, method = "anova")
+rpart.plot(tree1)
+
+# importance of variables
+tree1$variable.importance
+
+# predict using tree1
+pred_t1_train = predict(tree1, data = train)
+rmse_t1_train = sqrt(mean((pred_t1_train - train$price)^2)); rmse_t1_train
+pred_t1 = predict(tree1, newdata = test)
+
+# calculate rmse_test
+library(Metrics)
+rmse_t1_test = rmse(actual = test$price, predicted = pred_t1); rmse_t1_test
+```
+
+### Tune the Tree
+
+cp: 0.0006  
+R2: 0.5420  
+RMSE_cv: 74.41  
+
+```{r}
+tuneGrid_t = expand.grid(cp = seq(0, 0.1, 0.0001))
+trControl_t = trainControl(method = 'cv', number = 5)
+
+tree_cv = train(price ~ ., data = analysis, method = 'rpart', 
+                trControl = trControl_t, tuneGrid = tuneGrid_t)
+
+# results
+tree_cv$results
+plot(tree_cv)
+tree_cv$bestTune
+rmse_t1_cv = min(tree_cv$results$RMSE); rmse_t1_cv
+```
+
+## Random Forest
+
+Since tuning random forest is really time consuming, here I just show the codes random forest and results.  
+
+RMSE_train: 65.22  
+RMSE_test: 67.84  
+
+```{r eval = F}
+library(randomForest)
+forest = randomForest(price ~ ., data = train, ntree = 1000)
+varImpPlot(forest, n.var = nrow(forest$importance))
+
+# predict by train
+pred_rf_train = predict(forest)
+rmse_rf_train = sqrt(mean((pred_rf_train - train$price)^2)); rmse_rf_train
+# predict by test
+pred_rf_test = predict(forest, newdata = test)
+rmse_rf_test = sqrt(mean((pred_rf_test - test$price)^2)); rmse_rf_test
+```
+
+## Ranger
+
+Now, let's try ranger to build the model. Considered of timing consumption, I simply put the code and the results here and did not run it.  
+
+RMSE_train: 30.65  
+RMSE_test: 68.61  
+
+```{r eval = F}
+library(ranger)
+forest_ranger = ranger(price ~ ., data = train, num.trees = 2000)
+
+# predict using train
+pred_ranger_train = predict(forest_ranger, data = train, num.trees = 2000)
+rmse_ranger_train = sqrt(mean((pred_ranger_train$predictions - train$price)^2)); rmse_ranger_train
+
+# predict using test
+pred_ranger_test = predict(forest_ranger, data = test, num.trees = 2000)
+rmse_ranger_test = sqrt(mean((pred_ranger_test$predictions - test$price)^2)); rmse_ranger_test
+```
+
+## Xgboost {.tabset}
+
+### Create Xgb.DMatrix
+
+First, let's convert data for xgboost model.  
+
+#### One-hot Encoding
+
+```{r}
+library(vtreat)
+trt = designTreatmentsZ(dframe = analysis,
+                        varlist = names(analysis)[2:(ncol(analysis)-1)])
+newvars = trt$scoreFrame[trt$scoreFrame$code %in% c('clean','lev'),'varName']
+
+# create analysis_dummy
+price = analysis$price
+analysis_dmy = prepare(treatmentplan = trt, dframe = analysis, varRestriction = newvars)
+combined = cbind(price, analysis_dmy)
+dim(combined)
+
+# dummy scoring data
+scoring_dmy = prepare(treatmentplan = trt, dframe = scoring, varRestriction = newvars)
+id = scoring$id
+dim(scoring_dmy)
+```
+
+#### Create xgb.DMatrix
+
+```{r}
+library(xgboost)
+# separate input and output for combined
+combined_input = combined[, -1]
+d_combined <- xgb.DMatrix(data = as.matrix(combined_input), label = price)
+dim(d_combined)
+
+# create scoring xgb.DMatrix
+dscoring = xgb.DMatrix(data = as.matrix(scoring_dmy))
+dim(dscoring)
+```
+
+### Find the best hyperparameter values
+
+Here, I simply put the code here and did not run it as it's really time consuming. The best parameters are shown below.  
+
+```{r eval = F}
+# lambda and alpha for normalization
+# max_depth and n_estimator for overfitting
+
+trControl_xgb = trControl_la <-trainControl(method = "cv", number = 5)
+xgb_grid = expand.grid(nrounds = 1500,
+                       eta = c(0.1, 0.05, 0.01),
+                       max_depth = c(8, 9, 12),
+                       gamma = 0,
+                       colsample_bytree = 0.8,
+                       min_child_weight = c(2, 3, 4),
+                       subsample = 0.8)
+
+xgb_caret <- train(x = as.matrix(combined_input), 
+                   y = combined$price, 
+                   method = 'xgbTree', 
+                   trControl= trControl_xgb, 
+                   tuneGrid = xgb_grid)
+xgb_caret$bestTune
+```
+
+### Find the Best Iteration
+
+RMSE_train: 33.46  
+RMSE_test: 62.83  
+
+```{r eval = F}
+# setting params
+best_param <- as.list(xgb_caret$bestTune)
+# cross validation using best_param
+xgbcv <- xgb.cv(params = best_param, 
+                nrounds = 1500, 
+                data = d_combined, 
+                nfold = 5, 
+                showsd = T, 
+                stratified = T, 
+                print_every_n = 100, 
+                early_stopping_rounds = 100, 
+                maximize = F)
+rmse_xgb_test = min(xgbcv$evaluation_log$test_rmse_mean); rmse_xgb_test
+```
+
+### Build the Best Xgboost Model
+
+```{r eval = F}
+mod_xgb <- xgb.train(params = default_param,
+                     data = d_combined,
+                     nrounds = xgbcv$best_iteration)
+```
+
+## Results
+
+Take a look at the result, we can see that xgboost generated the best RMSE, so I used xgboost model on scoring data. The scores on Kaggle are:  
+Public Leaderboard: 68.39  
+Private Leaderboard: 61.22  
+
+```{r}
+results <- data.frame(model = c("Linear Regression", "Forward Selection", "Lasso", "Tuned Lasso",
+                                "Tree", "Tuned Tree", "Random Forest", "Ranger", "Xgboost"),
+                      RMSE = round(c(rmse_mod1_test, rmse_fw_test, rmse_la_test, rmse_la_cv, 
+                                     rmse_t1_test, rmse_t1_cv, 67.84, 68.61, 62.83), 4))
+datatable(results)
+```
+
